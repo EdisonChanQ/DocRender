@@ -1,0 +1,15 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+SQLAlchemy>=2.0.36
+PyMySQL>=1.1.1
+psycopg2-binary>=2.9.10
+pyodbc>=5.1.0
+PyMuPDF>=1.24.0
+Pillow>=10.4.0
+pytesseract>=0.3.13
+pyzbar>=0.1.9
+rapidocr-onnxruntime>=1.4.0
+pywin32>=306; sys_platform == "win32"

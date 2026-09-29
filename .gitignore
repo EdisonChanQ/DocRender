@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Env
+.env
+backend/.env
+frontend/.env
+
+# Storage / uploads
+backend/storage/
+
+# OCR 模型（163MB，体积过大；按 README 说明另行下载）
+backend/models/onnx/
+
+# 开发记忆与项目笔记（本地使用，不入库）
+.workbuddy/
+
+# Node
+node_modules/
+frontend/dist/
+npm-debug.log*
+
+# Build artifacts
+*.tsbuildinfo
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
