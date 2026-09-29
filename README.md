@@ -30,6 +30,11 @@ frontend/
 
 ## 快速开始
 
+> ⚠️ **建表不是自动的**。`migrate.py` 依赖 `backend/storage/database.json` 里的连接配置，
+> 而该文件不在版本库中（`storage/` 已排除）。所以首次部署的顺序是：
+> **配好数据库连接 → 跑 migrate 建表 → 启动后端**。
+> 未配置前直接跑 `migrate.py` 会报 `尚未配置数据库连接，无法执行建表脚本`。
+
 ### 1. 后端
 
 ```bash
@@ -38,13 +43,43 @@ python -m venv .venv
 .venv\Scripts\activate            # Windows
 pip install -r requirements.txt
 copy .env.example .env           # 按需修改
+```
 
-# 配置数据库连接后建表
-python migrate.py
+**配置数据库连接**：填写 `backend/storage/database.json`（可参照下方模板，
+也可启动后端后在前端「数据库配置」页填写并测试连通性）。
 
-# 启动（默认 0.0.0.0:8000，API 前缀 /api）
+```json
+{
+  "type": "sqlserver",
+  "host": "127.0.0.1",
+  "port": 1433,
+  "database": "docRender",
+  "username": "sa",
+  "password": "<your-password>",
+  "charset": "utf8mb4",
+  "driver": "ODBC Driver 17 for SQL Server"
+}
+```
+
+> **数据库方言**：表 DDL 为 **T-SQL（SQL Server）** 方言（`dbo.` schema / `INT IDENTITY` /
+> `SYSUTCDATETIME()` / `GO` 批次），**SQLite / MySQL / PostgreSQL 建表会失败** —— 
+> 配置页虽可选这些类型，但当前只有 SQL Server 可用。换库需先改写 `backend/app/db/tables/*.py` 的 DDL。
+
+**建表**（幂等，可重复执行）：
+
+```bash
+python migrate.py            # 全部 7 张表
+python migrate.py --list     # 只看清单，不连库
+python migrate.py category   # 只建指定表
+```
+
+**启动**（默认 `0.0.0.0:8000`，API 前缀 `/api`）：
+
+```bash
 python run_dev.py
 ```
+
+启动后 worker 随后端自动挂载，上传的文件即自动被抢占处理。
 
 ### 2. 前端
 
@@ -103,8 +138,25 @@ jobs/{分类code}/{yyyyMM}/{yyyyMMdd}/{job_code}/
 
 `backend/service/` 提供 `install_service.bat` / `uninstall_service.bat`，将后端注册为 Windows 服务。
 
+## 首次部署检查清单
+
+clone 下来后需要按顺序补齐以下内容才能跑通全流程：
+
+| # | 事项 | 说明 |
+|---|---|---|
+| 1 | `pip install -r backend/requirements.txt` | 依赖安装 |
+| 2 | 填 `backend/storage/database.json` | 连接配置，不入库；缺它 `migrate.py` 会直接报错 |
+| 3 | `python migrate.py` | **必须手动执行**，无自动建表 |
+| 4 | 下载 OCR 模型到 `backend/models/onnx/` | 约 163MB，不入库；缺它 OCR 提取不可用 |
+| 5 | 配「路径管理」的 `default` 记录 | 上传落盘需共享目录，缺它上传报 400 |
+| 6 | 建分类 / 模板 / 字段标注 | 否则任务无法匹配与提取 |
+
+第 5 项最容易被漏：`file_job_service.get_shared_dir("default")` 要求路径表里存在
+`code='default'` 且 `is_enabled=1` 的记录，否则上传接口直接返回
+`路径注册表缺少启用中的 code='default' 记录`。
+
 ## 配置说明
 
 - `WORKER_ENABLED=true` 时，流水线 worker 随后端自动后台挂载；设为 `false` 需自行运行 `python worker.py run`
-- `DEBUG=true` 会启用 uvicorn reload，**文件一变就重启进程、PowerShell worker 一同被杀**，日常调试建议 `false`
+- `DEBUG=true` 会启用 uvicorn reload，**文件一变就重启进程、worker 线程一同被杀**，日常调试建议 `false`
 - 数据库凭据等敏感配置在 `backend/storage/database.json`，已被 `.gitignore` 排除
