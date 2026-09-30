@@ -179,11 +179,10 @@ def update_path_config(path_id: int, payload: PathConfigUpdate) -> PathConfigPub
             if "is_enabled" in params:
                 params["is_enabled"] = bool(params["is_enabled"])
             params["id"] = path_id
-            params["updated_datetime"] = datetime.now(timezone.utc)
             conn.execute(
                 text(
                     f"UPDATE {PATH_CONFIG_TABLE} SET {assignments}, "
-                    f"updated_datetime = :updated_datetime, updated_by = SUSER_SNAME() "
+                    f"updated_datetime = SYSUTCDATETIME(), updated_by = SUSER_SNAME() "
                     f"WHERE id = :id"
                 ),
                 params,

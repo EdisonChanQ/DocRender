@@ -70,6 +70,11 @@ import numpy as np
 # —— matchTemplate（仅块模板粗定位用）阈值 ——
 MIN_SCORE = 0.30
 RELATIVE_SCORE = 0.50
+# 近失候选：低于 th 但 ≥ 此下限的峰交给 ECC 复核救援。
+# matchTemplate 对底色/纹理差异敏感（白底范本 vs 绿底划线付支票实测仅 0.2982），
+# ECC 对此稳健（同一张 0.7073）——单闸门会静默丢真票（JOB202609300828497D99 p0 3张只出2张）。
+NEAR_MISS_FLOOR = 0.15
+NEAR_MISS_MAX = 5  # 每页最多救援尝试次数（防噪声峰拖慢）
 
 # —— ECC 相关度分档（决定页的处置策略）——
 SCORE_AUTO = 0.75     # ≥ 自动通过
@@ -79,12 +84,25 @@ SCORE_REJECT = 0.45   # < 拒绝（整页回退，仅文本提取）
 PAGE_MODE_FULL = "full_page"   # 整页模板：声明尺寸 ≈ 页图尺寸，不切块
 PAGE_MODE_BLOCK = "block"      # 局部块模板：一页多块，需粗定位
 
-# 判为整页模板的尺寸偏差容忍度（声明尺寸 vs 页图尺寸，宽高都要满足）
-FULL_PAGE_TOLERANCE = 0.02
+# 判为整页模板的尺寸偏差容忍度（声明尺寸 vs 页图尺寸，宽高都要满足）。
+# 0.10 = 门框归一化容差：用户可按标准门框设定 width/height（如 1600×2300），
+# 上传件按 dpi 渲染后与门框有小幅差异（如 200dpi 整页 1655×2340，差 ~3.4%）仍判
+# full_page，由 ECC 配准 scale 自适应缩放。dpi 是取样密度非物理真值，不以它锁死门框。
+# 真正的 block 模板声明尺寸远小于页图（差 >10%），不受影响。
+FULL_PAGE_TOLERANCE = 0.10
 
 ECC_MAX_ITER = 300
 ECC_EPS = 1e-7
 ECC_GAUSSIAN_BLUR = 5
+
+# —— 粗对齐（ECC 初值）——
+# ECC 自单位矩阵起步的捕获范围只有 ~±15px；实测 JOB20260930041810CFC7 p2
+# 真实偏移 21px，ECC 原地收敛返回未对齐相关度 0.32 → 误拒（实际可达 0.89）。
+# 策略：identity 起步保持原口径不变；仅当结果未达 auto 档（或有理由怀疑没走到
+# 对齐位置）时，才用 phaseCorrelate 平移初值重跑一次，取更优解。
+# 实测：p0/p1/p3 分数与旧实现逐位一致，p2 0.3222 → 0.8845（auto）。
+PHASE_MIN_RESPONSE = 0.03   # 响应度低于此（低纹理/纯色页）视为不可信，不重试
+PHASE_MAX_SHIFT = 0.45      # 平移超过图幅 45% 视为不可信（正常页不会偏这么多）
 
 
 def to_gray(img) -> np.ndarray:
@@ -131,6 +149,37 @@ def detect_page_mode(
     return PAGE_MODE_BLOCK
 
 
+def _coarse_shift(ref_gray: np.ndarray, page_gray: np.ndarray) -> tuple[float, float] | None:
+    """相位相关求「页相对范本」的全局平移初值（ECC 捕获范围 ~±15px 不够用的补救）。
+
+    cv2.phaseCorrelate(ref, page) 返回 (dx, dy)：page 内容相对 ref 的位移，
+    即范本坐标 → 页缩图坐标的平移分量（probe 实测钉死符号：p2 dx,dy=(-3.1,-21.9)，
+    W0 平移列直接取该值 → ECC 收敛 cc=0.8845；取反或单位阵 → 0.20/0.33）。
+    响应度过低（低纹理/纯色）或位移超图幅 45% 视为不可信，返回 None 走单位阵。
+    """
+    h, w = ref_gray.shape
+    try:
+        win = cv2.createHanningWindow((w, h), cv2.CV_32F)
+        (dx, dy), resp = cv2.phaseCorrelate(
+            ref_gray.astype(np.float32), page_gray.astype(np.float32), win
+        )
+    except cv2.error:
+        return None
+    if resp < PHASE_MIN_RESPONSE:
+        return None
+    if abs(dx) > w * PHASE_MAX_SHIFT or abs(dy) > h * PHASE_MAX_SHIFT:
+        return None
+    return float(dx), float(dy)
+
+
+def _identity_ncc(a: np.ndarray, b: np.ndarray) -> float:
+    """两图（同尺寸 float 通道）零平移处的归一化互相关 —— ECC cc 的未对齐基准值。"""
+    am = a.ravel() - a.mean()
+    bm = b.ravel() - b.mean()
+    denom = float(np.linalg.norm(am) * np.linalg.norm(bm))
+    return float(am @ bm / denom) if denom > 0 else 0.0
+
+
 def register_ecc(ref_gray: np.ndarray, page_at_ref_size_gray: np.ndarray) -> tuple[float, np.ndarray | None]:
     """ECC 仿射配准。
 
@@ -155,22 +204,41 @@ def register_ecc(ref_gray: np.ndarray, page_at_ref_size_gray: np.ndarray) -> tup
         return 0.0, None
     if ref_gray.shape[0] < 8 or ref_gray.shape[1] < 8:
         return 0.0, None
-    W = np.eye(2, 3, dtype=np.float32)
+    ref_f = ref_gray.astype(np.float32) / 255.0
+    page_f = page_at_ref_size_gray.astype(np.float32) / 255.0
     crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, ECC_MAX_ITER, ECC_EPS)
+
+    # ① identity 起步（保持原口径，绝大多数正常页一次即达 auto）
+    best_cc = 0.0
+    best_W: np.ndarray | None = None
     try:
-        cc, W = cv2.findTransformECC(
-            ref_gray.astype(np.float32) / 255.0,
-            page_at_ref_size_gray.astype(np.float32) / 255.0,
-            W,
-            cv2.MOTION_AFFINE,
-            crit,
-            None,
-            ECC_GAUSSIAN_BLUR,
-        )
-        return float(cc), W
+        cc, W = cv2.findTransformECC(ref_f, page_f, np.eye(2, 3, dtype=np.float32),
+                                     cv2.MOTION_AFFINE, crit, None, ECC_GAUSSIAN_BLUR)
+        best_cc, best_W = float(cc), W
     except cv2.error:
-        # 尺寸为 0、全黑、收敛失败等 → 交给调用方回退
-        return 0.0, None
+        pass  # 全黑/不收敛 → 让 ② 再试一次，仍失败则 (0.0, None)
+
+    # ② 未达 auto 才用相位相关平移初值重跑（捕获范围 ~±15px → 全图）。
+    #    取两次更优解，绝不比 identity 更差；identity 已 auto 的页零额外开销。
+    if best_cc < SCORE_AUTO:
+        shift = _coarse_shift(ref_gray, page_at_ref_size_gray)
+        if shift is not None:
+            W0 = np.array([[1.0, 0.0, shift[0]], [0.0, 1.0, shift[1]]], dtype=np.float32)
+            try:
+                cc2, W2 = cv2.findTransformECC(ref_f, page_f, W0,
+                                               cv2.MOTION_AFFINE, crit, None, ECC_GAUSSIAN_BLUR)
+                if float(cc2) > best_cc:
+                    best_cc, best_W = float(cc2), W2
+            except cv2.error:
+                pass
+
+    # ③ 护栏：两次都没超过 identity 处基准相关度 → 视为配准失败
+    #    （identity 起步且没挪动时，cc 就等于未对齐相关度，不该当匹配度用）
+    if best_W is not None and best_cc > 0:
+        id_ncc = _identity_ncc(ref_f, page_f)
+        if best_cc <= id_ncc + 1e-6 and np.allclose(best_W[:, 2], 0, atol=0.5):
+            return 0.0, None
+    return best_cc, best_W
 
 
 def map_box(
@@ -343,11 +411,18 @@ def find_template_boxes(
     *,
     min_score: float = MIN_SCORE,
     relative: float = RELATIVE_SCORE,
-) -> list[tuple[int, int, int, int]]:
+    near_miss_floor: float = NEAR_MISS_FLOOR,
+) -> tuple[list[tuple[int, int, int, int]], list[tuple[float, tuple[int, int, int, int]]], float]:
     """在页图中粗定位模板实例（**仅供局部块模板使用**）。
 
-    返回页图坐标空间下的 [(x, y, w, h), ...]，按 y 升序（页面上从上到下）。
-    无有效命中返回 []（调用方应决定回退策略）。
+    返回 (boxes, near_miss, threshold)：
+      boxes     : 过阈值的块，页图坐标 [(x, y, w, h), ...]，按 y 升序
+      near_miss : 未过阈值但 ≥ near_miss_floor 的独立峰 [(coarse_score, (x,y,w,h)), ...]
+                  按分数降序 —— matchTemplate 对底色/防伪纹理差异敏感，这类
+                  "近失"里可能有真票（如绿底划线付支票 0.2982 < th=0.3876），
+                  调用方应对其做 ECC 复核救援，而不是静默丢弃
+      threshold : 本次实际使用的阈值（供日志/落库说明"为什么丢"）
+    无有效命中返回 ([], [], th 或 0)。
 
     ⚠ 整页模板场景**不要**调用本函数：模板尺寸 ≈ 页图尺寸时滑窗无位移空间，
     得分退化为整体相似度，阈值不可靠（实测 0.3129 命中 / 0.2992 失败）。
@@ -356,10 +431,10 @@ def find_template_boxes(
     ph, pw = page_gray.shape
     rh, rw = ref_gray.shape
     if rh < 8 or rw < 8 or ph < 8 or pw < 8:
-        return []
+        return [], [], 0.0
     if pw < rw or ph < rh:
         # 范本比页图大：无法匹配
-        return []
+        return [], [], 0.0
 
     k = rw / pw  # 页图缩放系数（缩到「页宽 = 范本宽」）
     if k >= 1.0:
@@ -369,18 +444,17 @@ def find_template_boxes(
         sp = cv2.resize(page_gray, (rw, sh), interpolation=cv2.INTER_AREA)
         back = 1.0 / k
         if sp.shape[0] < rh or sp.shape[1] < rw:
-            return []
+            return [], [], 0.0
 
     res = cv2.matchTemplate(sp, ref_gray, cv2.TM_CCOEFF_NORMED)
     row_max = res.max(axis=1)
     best = float(row_max.max())
-    if best < min_score:
-        return []
     th = max(min_score, best * relative)
 
-    ys = np.where(row_max >= th)[0]
+    # 收集所有 ≥ near_miss_floor 的连续行组：≥ th 的是正式块，[floor, th) 的是近失候选
+    ys = np.where(row_max >= near_miss_floor)[0]
     if ys.size == 0:
-        return []
+        return [], [], th
 
     # 连续 y 归为一组（间隔 < 范本高一半视为同一块，避免一块出多个峰）
     groups: list[list[int]] = [[int(ys[0])]]
@@ -392,11 +466,17 @@ def find_template_boxes(
 
     bw, bh = int(round(rw * back)), int(round(rh * back))
     boxes: list[tuple[int, int, int, int]] = []
+    near: list[tuple[float, tuple[int, int, int, int]]] = []
     for g in groups:
         y = max(g, key=lambda i: row_max[i])
         x = int(np.argmax(res[y]))
         bx = max(0, min(int(round(x * back)), pw - 1))
         by = max(0, min(int(round(y * back)), ph - 1))
-        boxes.append((bx, by, min(bw, pw - bx), min(bh, ph - by)))
+        box = (bx, by, min(bw, pw - bx), min(bh, ph - by))
+        if float(row_max[y]) >= th:
+            boxes.append(box)
+        else:
+            near.append((float(row_max[y]), box))
     boxes.sort(key=lambda b: b[1])
-    return boxes
+    near.sort(key=lambda t: -t[0])  # 分数高的优先救援
+    return boxes, near[:NEAR_MISS_MAX], th

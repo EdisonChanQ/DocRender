@@ -4,6 +4,7 @@ import CategoryPage from "./pages/CategoryPage";
 import DatabasePage from "./pages/DatabasePage";
 import FileJobPage from "./pages/FileJobPage";
 import FlowTestPage from "./pages/FlowTestPage";
+import LlmToTextPage from "./pages/LlmToTextPage";
 import OcrToTextPage from "./pages/OcrToTextPage";
 import ParsePage from "./pages/ParsePage";
 import PathConfigPage from "./pages/PathConfigPage";
@@ -40,6 +41,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: "/tools/qr-to-text", label: "QR-to-Text" },
       { to: "/tools/ocr-to-text", label: "OCR-to-Text" },
+      { to: "/tools/llm-to-text", label: "LLM-to-Text" },
     ],
   },
   {
@@ -89,6 +91,7 @@ export default function App() {
           <Route path="/flow-test" element={<FlowTestPage />} />
           <Route path="/tools/qr-to-text" element={<QrToTextPage />} />
           <Route path="/tools/ocr-to-text" element={<OcrToTextPage />} />
+          <Route path="/tools/llm-to-text" element={<LlmToTextPage />} />
           <Route path="/database" element={<DatabasePage />} />
         </Routes>
       </main>

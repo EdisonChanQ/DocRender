@@ -90,6 +90,7 @@ def render_and_save(
       page_count: 源文件页数
       matched: 成功配准的块数
       rejected: 相关度 <SCORE_REJECT 被隔离到 reject/ 的块数
+      dropped: 粗定位阶段被丢弃/救援失败的候选明细（含分数与原因，供日志排查）
       template_id / template_code: 若全部页选中同一模板则为该模板，否则 None
     """
     suffix = Path(filename or "").suffix.lower()
@@ -115,9 +116,12 @@ def render_and_save(
     seq = 0
     matched_total = 0
     rejected_total = 0
+    dropped: list[dict] = []
 
     for src_idx, (img, scan_dpi) in enumerate(source_pages):
-        for box, align in _locate_blocks(img, cands):
+        page_blocks, page_dropped = _locate_blocks(img, cands)
+        dropped.extend({"page": src_idx, **d} for d in page_dropped)
+        for box, align in page_blocks:
             bx, by, bw, bh = box
             if bx == 0 and by == 0 and bw == img.width and bh == img.height:
                 crop = img
@@ -161,6 +165,8 @@ def render_and_save(
                     "template_id": align.get("template_id"),
                     "template_code": align.get("template_code"),
                     "candidates": align.get("candidates") or [],
+                    "rescued": bool(align.get("rescued")),
+                    "locate_note": align.get("locate_note"),
                     "align": {
                         "matrix": align.get("matrix"),
                         "scale": align.get("scale", 1.0),
@@ -177,6 +183,7 @@ def render_and_save(
         "page_count": len(source_pages),
         "matched": matched_total,
         "rejected": rejected_total,
+        "dropped": dropped,  # 粗定位丢弃/救援失败明细（worker 落日志，杜绝"凭空消失"）
         "template_id": only,
         "template_code": next(
             (b["template_code"] for b in blocks if b["template_id"] == only), None
@@ -207,26 +214,34 @@ def _build_candidates(template, templates: list | None) -> list[dict]:
     return out
 
 
-def _locate_blocks(img, cands: list[dict]) -> list[tuple[tuple[int, int, int, int], dict]]:
+def _locate_blocks(img, cands: list[dict]) -> tuple[list[tuple[tuple[int, int, int, int], dict]], list[dict]]:
     """定位本页的块，并给出每块的配准信息（含多模板选版）。
 
     - 无范本图 → 整页单块、无配准
     - 多候选 → 每候选整页 ECC，相关度最高者胜出（记录全部候选分供排查）
     - 整页模板 → 不切块；局部块模板 → 粗定位 N 块 + 各块 local ECC 精配准
+    - 粗定位"近失"峰（matchTemplate 分未过阈值但 ≥ floor）→ ECC 复核救援：
+      matchTemplate 对底色/防伪纹理敏感（白底范本 vs 绿底划线付票 0.298 < 阈值），
+      ECC 稳健（同票 0.707）。救援成功照常出块（标 rescued）；失败/丢弃全部记入
+      dropped 返回给调用方落日志 —— 杜绝"票在页上但产物凭空消失且无提示"。
+    返回 (blocks, dropped)。
     """
     whole = (0, 0, img.width, img.height)
     with_ref = [c for c in cands if c["ref_img"] is not None]
     if not with_ref:
-        return [
-            (
-                whole,
-                {
-                    "score": None, "band": "unknown", "matrix": None,
-                    "scale": 1.0, "offset": (0.0, 0.0), "page_mode": None,
-                    "template_id": None, "template_code": None, "candidates": [],
-                },
-            )
-        ]
+        return (
+            [
+                (
+                    whole,
+                    {
+                        "score": None, "band": "unknown", "matrix": None,
+                        "scale": 1.0, "offset": (0.0, 0.0), "page_mode": None,
+                        "template_id": None, "template_code": None, "candidates": [],
+                    },
+                )
+            ],
+            [],
+        )
 
     page_gray = to_gray(img)
 
@@ -247,17 +262,14 @@ def _locate_blocks(img, cands: list[dict]) -> list[tuple[tuple[int, int, int, in
 
     if best["page_mode"] == tm.PAGE_MODE_FULL:
         # 整页模板：不切块，整页即单块
-        return [(whole, best)]
+        return [(whole, best)], []
 
-    # 局部块模板：粗定位 + 每块局部精配准
+    # 局部块模板：粗定位 + 每块局部精配准 + 近失峰 ECC 救援
     ref_gray = to_gray(best_c["ref_img"])
-    boxes = tm.find_template_boxes(page_gray, ref_gray)
-    if not boxes:
-        # 定位失败 → 回退整页块（保留整体相关度供提示图例展示）
-        return [(whole, best)]
+    boxes, near, th = tm.find_template_boxes(page_gray, ref_gray)
+    dropped: list[dict] = []
 
-    out: list[tuple[tuple[int, int, int, int], dict]] = []
-    for box in boxes:
+    def _mk_align(box):
         align = tm.align_block(page_gray, ref_gray, box)
         align["page_mode"] = tm.PAGE_MODE_BLOCK
         align["template_id"] = best_c["id"]
@@ -267,8 +279,39 @@ def _locate_blocks(img, cands: list[dict]) -> list[tuple[tuple[int, int, int, in
         # 字段坐标**不得**再叠加「块在整页上的偏移」（align_block 返回的 offset），
         # 否则双重计算 → 字段下移一个块高、越界被丢弃、退化成整页块。
         align["offset"] = (0.0, 0.0)
-        out.append((box, align))
-    return out
+        return align
+
+    out: list[tuple[tuple[int, int, int, int], dict]] = []
+    for box in boxes:
+        out.append((box, _mk_align(box)))
+
+    for coarse, box in near:
+        align = _mk_align(box)
+        if align["band"] in ("auto", "low"):
+            align["rescued"] = True
+            align["coarse_score"] = round(coarse, 4)
+            out.append((box, align))
+        else:
+            dropped.append(
+                {
+                    "box": box, "coarse": round(coarse, 4), "threshold": round(th, 4),
+                    "ecc": round(align["score"], 4), "band": align["band"],
+                    "reason": "近失峰 ECC 复核仍 reject",
+                }
+            )
+
+    if not out:
+        note = (
+            f"粗定位 0 框（阈值 {th:.3f}）"
+            + (f"，{len(near)} 个近失峰救援失败" if dropped else "，无近失峰")
+            + " → 回落整页"
+        )
+        best["locate_note"] = note
+        dropped.append({"reason": note, "threshold": round(th, 4), "boxes": 0})
+        return [(whole, best)], dropped
+
+    out.sort(key=lambda t: t[0][1])
+    return out, dropped
 
 
 def _skew_from_matrix(matrix) -> float:

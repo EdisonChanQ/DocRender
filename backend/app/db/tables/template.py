@@ -12,7 +12,7 @@ from app.db.tables.base import TableDef
 
 TABLE = TableDef(
     key="template",
-    name="Sup_EWP_DCR_Template",
+    name="Sup_DCR_Template",
     comment="模板表",
     ddl="""
 IF NOT EXISTS (

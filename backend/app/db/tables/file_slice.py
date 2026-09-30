@@ -14,7 +14,7 @@ from app.db.tables.base import TableDef
 
 TABLE = TableDef(
     key="file_slice",
-    name="Sup_EWP_DCR_FileSlice",
+    name="Sup_DCR_FileSlice",
     comment="切片明细表",
     ddl="""
 IF NOT EXISTS (
@@ -36,7 +36,7 @@ BEGIN
         width       INT               NOT NULL,                                              -- 块宽
         height      INT               NOT NULL,                                              -- 块高
         result_content NVARCHAR(MAX)  NULL,                                                  -- 解析结果原文（OCR 文本 / QR 载荷）
-        source      NVARCHAR(8)       NULL,                                                  -- 提取来源：OCR / QR
+        source      NVARCHAR(8)       NULL,                                                  -- 提取来源：OCR / QR / LLM（低置信兜底）
         confidence  FLOAT             NULL,                                                  -- 置信度 0~1（QR 无置信度为 NULL）
         created_by        NVARCHAR(64) NOT NULL CONSTRAINT DF_${TABLE_NAME}_created_by DEFAULT SUSER_SNAME(), -- 创建人
         created_datetime  DATETIME     NOT NULL CONSTRAINT DF_${TABLE_NAME}_created_datetime DEFAULT SYSUTCDATETIME(), -- 创建时间（UTC）

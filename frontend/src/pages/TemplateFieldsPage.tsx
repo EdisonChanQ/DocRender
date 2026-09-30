@@ -324,6 +324,7 @@ export default function TemplateFieldsPage() {
               >
                 <option value="text">文字（OCR）</option>
                 <option value="qr">二维码（QR）</option>
+                <option value="llm">大模型（LLM）</option>
               </select>
             </label>
             <label className="form__field">
@@ -383,11 +384,17 @@ export default function TemplateFieldsPage() {
                   <span className="field-item__label">
                     {f.label}
                     <span
-                      className={`status status--${f.field_type === "qr" ? "info" : "muted"}`}
+                      className={`status status--${f.field_type === "qr" ? "info" : f.field_type === "llm" ? "ok" : "muted"}`}
                       style={{ marginLeft: 6 }}
-                      title={f.field_type === "qr" ? "二维码解码" : "OCR 文字识别"}
+                      title={
+                        f.field_type === "qr"
+                          ? "二维码解码"
+                          : f.field_type === "llm"
+                            ? "多模态大模型识别（手写/盖章等 OCR 不可靠的块）"
+                            : "OCR 文字识别"
+                      }
                     >
-                      {f.field_type === "qr" ? "QR" : "文字"}
+                      {f.field_type === "qr" ? "QR" : f.field_type === "llm" ? "LLM" : "文字"}
                     </span>
                   </span>
                   <span className="field-item__key mono">{f.field_key}</span>

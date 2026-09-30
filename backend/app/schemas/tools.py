@@ -32,3 +32,12 @@ class OcrFileResult(BaseModel):
     channel: str | None = Field(default=None, description="实际使用的识别通道：detect/crop")
     server_ms: float = Field(default=0.0, description="后端处理耗时（毫秒），并发压测指标")
     error: str | None = None
+
+
+class LlmFileResult(BaseModel):
+    filename: str
+    ok: bool
+    text: str = Field(default="", description="大模型识别出的全文（多行）")
+    model: str = Field(default="", description="实际使用的模型名")
+    server_ms: float = Field(default=0.0, description="后端处理耗时（毫秒），并发压测指标")
+    error: str | None = None

@@ -236,11 +236,10 @@ def update_field(field_id: int, payload: TemplateFieldUpdate) -> TemplateFieldPu
             assignments = ", ".join(f"{col} = :{col}" for col in allowed)
             params = dict(allowed)
             params["id"] = field_id
-            params["updated_datetime"] = datetime.now(timezone.utc)
             conn.execute(
                 text(
                     f"UPDATE {FIELD_TABLE} SET {assignments}, "
-                    f"updated_datetime = :updated_datetime, updated_by = SUSER_SNAME() "
+                    f"updated_datetime = SYSUTCDATETIME(), updated_by = SUSER_SNAME() "
                     f"WHERE id = :id"
                 ),
                 params,

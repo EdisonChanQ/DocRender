@@ -103,6 +103,16 @@ backend/models/onnx/PP-OCRv6/
   rec/PP-OCRv6_rec_small.onnx      # 文本识别（轻量，约 21MB）
 ```
 
+下载源（RapidOCR v3.9.2 onnx 发布，ModelScope 国内直连）：
+
+```powershell
+$base = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6"
+Invoke-WebRequest "$base/det/PP-OCRv6_det_medium.onnx" -OutFile "backend/models/onnx/PP-OCRv6/det/PP-OCRv6_det_medium.onnx"
+Invoke-WebRequest "$base/det/PP-OCRv6_det_small.onnx"  -OutFile "backend/models/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx"
+Invoke-WebRequest "$base/rec/PP-OCRv6_rec_medium.onnx" -OutFile "backend/models/onnx/PP-OCRv6/rec/PP-OCRv6_rec_medium.onnx"
+Invoke-WebRequest "$base/rec/PP-OCRv6_rec_small.onnx"  -OutFile "backend/models/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx"
+```
+
 模型配置见 `backend/models/config_v6_medium.yaml` / `config_v6_small.yaml` / `config_detect.yaml`。
 
 ## 任务与队列模型

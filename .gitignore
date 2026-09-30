@@ -20,6 +20,10 @@ backend/models/onnx/
 # 开发记忆与项目笔记（本地使用，不入库）
 .workbuddy/
 
+# ⚠ 诊断探针目录：整体不入库（一次性诊断脚本 + 产物含**真实银行支票/汇款单图像**，
+#   HSBC、恒生票据严禁上传；脚本内含内网 IP/UNC 路径）。本地保留可随时复跑。
+_probe/
+
 # Node
 node_modules/
 frontend/dist/

@@ -1,6 +1,6 @@
 import { jsonRequest, request } from "./client";
 
-export type FieldType = "text" | "qr";
+export type FieldType = "text" | "qr" | "llm";
 
 export interface TemplateField {
   id: number;

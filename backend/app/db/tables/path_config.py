@@ -11,7 +11,7 @@ from app.db.tables.base import TableDef
 
 TABLE = TableDef(
     key="path_config",
-    name="Sup_EWP_DCR_Path",
+    name="Sup_DCR_Path",
     comment="路径配置表",
     ddl="""
 IF NOT EXISTS (

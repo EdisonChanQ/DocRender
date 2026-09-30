@@ -1,8 +1,11 @@
 """模板制作：临时解析上传文件为页预览图（纯交互，不落盘不落库）。
 
-- 预览图按 PREVIEW_DPI 渲染并转 JPEG（控制响应体：300dpi PNG 每页 5MB+ 不可接受）。
-- 每页同时报告预览像素尺寸（框选坐标系）与按估算扫描 dpi 的物理像素尺寸
-  （前端把框选比例换算成最终 width/height 提交）。
+- 预览图按**真实尺寸**渲染并转 JPEG：PDF 按估算扫描 dpi（估不出默认 300）、
+  图片按元数据 dpi（缺失按 300），preview_w/h == full_w/h == 真实像素尺寸，
+  前端所见即所得（显示层缩放不影响框选坐标系）。
+  （方案 A：不再用 150dpi 缩略 + 估算 dpi 换算两条链，两数恒差 2 倍且互不相干。）
+- 每页同时报告预览像素尺寸（= 真实尺寸，框选坐标系）与 dpi，
+  前端把框选比例换算成最终 width/height 提交（scale = full/preview = 1）。
 - PDF：PyMuPDF 渲染；扫描件 dpi 从内嵌图像素/页物理英寸估算。
 - 图片：单页，dpi 读元数据（缺失按 300）。
 """
@@ -14,8 +17,10 @@ from io import BytesIO
 
 from app.core.errors import ParserError
 
-PREVIEW_DPI = 150  # 预览/框选坐标系
-DEFAULT_SCAN_DPI = 300  # 无法估算时的缺省扫描分辨率
+# 方案 A 起预览即真实尺寸渲染，PREVIEW_DPI 已不再用于预览降采样；
+# 保留常量仅为兼容引用检查，无实际作用。
+PREVIEW_DPI = 150
+DEFAULT_SCAN_DPI = 200  # 无法精确估算扫描 dpi 时的回退默认值（与用户转图基准 1655×2340 一致）
 MAX_PAGES = 30
 JPEG_QUALITY = 85
 
@@ -80,9 +85,9 @@ def prepare_pages(data: bytes, filename: str) -> dict:
     """返回 {kind, preview_dpi, page_count, pages:[{index, preview_w/h, full_w/h, dpi, skew, data_url}]}。
 
     preview_w/h：data_url 图片像素尺寸（框选坐标系）。
-    full_w/h：该页在 dpi（估算扫描分辨率）下的物理像素尺寸。
+    full_w/h：**与 preview_w/h 恒等**（方案 A：预览即真实尺寸渲染，不再换算）。
     skew：建议的自动修正角（度，正值=逆时针旋转可摆正），检测失败为 0。
-    前端提交时：width = round(crop_w / preview_w * full_w)，height 同理。
+    前端提交时：width = round(crop_w / preview_w * full_w) = crop_w（scale=1）。
     """
     from pathlib import Path
 
@@ -95,16 +100,18 @@ def prepare_pages(data: bytes, filename: str) -> dict:
             img = Image.open(BytesIO(data))
         except Exception as exc:  # noqa: BLE001
             raise TemplatePrepareError(f"无法读取图片：{exc}") from exc
+        dpi_estimated = False
         dpi = DEFAULT_SCAN_DPI
         try:
             meta_dpi = img.info.get("dpi")
             if meta_dpi and meta_dpi[0] > 20:
                 dpi = int(round(meta_dpi[0]))
+                dpi_estimated = True
         except Exception:  # noqa: BLE001
             pass
         rgb = img.convert("RGB")
-        scale = min(1.0, PREVIEW_DPI / dpi)
-        preview = rgb.resize((max(1, int(rgb.width * scale)), max(1, int(rgb.height * scale)))) if scale < 1 else rgb
+        # 方案 A：预览 = 原始尺寸原图（不降采样、不缩放）。
+        # 用户需要看到真实像素尺寸来设计模板门框；前端显示层自带缩放，不影响框选坐标。
         return {
             "kind": "image",
             "preview_dpi": dpi,
@@ -112,13 +119,14 @@ def prepare_pages(data: bytes, filename: str) -> dict:
             "pages": [
                 {
                     "index": 0,
-                    "preview_w": preview.width,
-                    "preview_h": preview.height,
+                    "preview_w": rgb.width,
+                    "preview_h": rgb.height,
                     "full_w": rgb.width,
                     "full_h": rgb.height,
                     "dpi": dpi,
-                    "skew": detect_skew(preview),
-                    "data_url": _encode_jpeg(preview),
+                    "dpi_estimated": dpi_estimated,
+                    "skew": detect_skew(rgb),
+                    "data_url": _encode_jpeg(rgb),
                 }
             ],
         }
@@ -135,30 +143,36 @@ def prepare_pages(data: bytes, filename: str) -> dict:
         try:
             if doc.page_count > MAX_PAGES:
                 raise TemplatePrepareError(f"页数 {doc.page_count} 超过上限 {MAX_PAGES}")
-            zoom = PREVIEW_DPI / 72.0
             pages = []
             for i, page in enumerate(doc):
+                # 方案 A：预览即真实尺寸 —— 按估算扫描 dpi（估不出默认 200）渲染整页，
+                # preview_w/h == full_w/h == 真实像素尺寸，前端所见即所得。
+                # 不再用 150dpi 缩略 + 估算 dpi 换算两条链（两数恒差 2 倍且互不相干）。
+                # dpi_estimated 标记该 dpi 是检测到的真实扫描 dpi 还是回退默认值，
+                # 前端据此如实提示，避免用户误把默认值当真实分辨率。
+                est_dpi = _estimate_pdf_dpi(page)
+                dpi = est_dpi or DEFAULT_SCAN_DPI
+                zoom = dpi / 72.0
                 pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
                 from PIL import Image
 
                 img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                dpi = _estimate_pdf_dpi(page) or DEFAULT_SCAN_DPI
-                scale = dpi / PREVIEW_DPI
                 pages.append(
                     {
                         "index": i,
                         "preview_w": pix.width,
                         "preview_h": pix.height,
-                        "full_w": int(round(pix.width * scale)),
-                        "full_h": int(round(pix.height * scale)),
+                        "full_w": pix.width,
+                        "full_h": pix.height,
                         "dpi": dpi,
+                        "dpi_estimated": est_dpi is not None,
                         "skew": detect_skew(img),
                         "data_url": _encode_jpeg(img),
                     }
                 )
             return {
                 "kind": "pdf",
-                "preview_dpi": PREVIEW_DPI,
+                "preview_dpi": pages[0]["dpi"] if pages else DEFAULT_SCAN_DPI,
                 "page_count": len(pages),
                 "pages": pages,
             }

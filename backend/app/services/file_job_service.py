@@ -17,6 +17,7 @@ from sqlalchemy.engine import Engine
 from app.db.config_store import config_store
 from app.db.manager import database_manager
 from app.db.tables import TABLES
+from app.services.db_retry import retry_on_lock_conflict
 from app.schemas.file_job import (
     JOB_STATES,
     JOB_STEPS,
@@ -387,8 +388,9 @@ def reclaim_expired(conn) -> int:
     return int(result.rowcount or 0)
 
 
+@retry_on_lock_conflict
 def claim_job(req: ClaimRequest) -> FileJobPublic | None:
-    """抢占一个待处理任务（READPAST 并发安全）；无任务返回 None。抢占前顺带回收到期租约。"""
+    """抢占一个待处理任务（READPAST 并发安全）；无任务返回 None。抢占前顺带回收到期租约。死锁/锁超时自动重试。"""
     engine = get_engine()
     _check_tables()
     with engine.begin() as conn:
@@ -401,7 +403,7 @@ def claim_job(req: ClaimRequest) -> FileJobPublic | None:
                 f"    lease_expires_datetime = DATEADD(MINUTE, :lease, SYSUTCDATETIME()), "
                 f"    updated_datetime = SYSUTCDATETIME() "
                 f"OUTPUT inserted.code "
-                f"WHERE id = (SELECT TOP 1 id FROM {JOB_TABLE} WITH (READPAST) "
+                f"WHERE id = (SELECT TOP 1 id FROM {JOB_TABLE} WITH (UPDLOCK, READPAST, ROWLOCK) "
                 f"            WHERE state = 0 ORDER BY priority DESC, id)"
             ),
             {"inst": req.instance_id, "lease": req.lease_minutes},

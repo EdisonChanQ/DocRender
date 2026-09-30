@@ -11,7 +11,7 @@ from app.db.tables.base import TableDef
 
 TABLE = TableDef(
     key="template_field",
-    name="Sup_EWP_DCR_Template_Field",
+    name="Sup_DCR_Template_Field",
     comment="模板字段明细表",
     ddl="""
 IF NOT EXISTS (

@@ -4,6 +4,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import {
   getTemplateDetail,
   prepareTemplateFile,
+  saveRefRendered,
   updateTemplate,
   type PreparedFile,
   type PreparedPage,
@@ -46,6 +47,8 @@ export default function TemplateMakerPage() {
   const [refDataUrl, setRefDataUrl] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  // 上传的源文件字节：保存时随模具请求提交，后端按门规格真重渲染范本
+  const [sourceFile, setSourceFile] = useState<File | null>(null);
   // 把既有范本直接载入画布做二次框选（无需重新上传源文件）
   const [refAsPage, setRefAsPage] = useState<PreparedPage | null>(null);
   // 用户清除范本后待提交的删除标记（保存时 ref_image 传 null）
@@ -191,6 +194,7 @@ export default function TemplateMakerPage() {
     try {
       const res = await prepareTemplateFile(file);
       setPrepared(res);
+      setSourceFile(file); // 模具重渲染的源字节
       setRefAsPage(null);
       setPageIndex(0);
       // 自动倾斜修正：后端 skew（正=需逆时针摆正）→ canvas rotation 取反
@@ -239,6 +243,7 @@ export default function TemplateMakerPage() {
       };
       setRefAsPage(refPage);
       setPrepared(null);
+      setSourceFile(null); // 以旧范本为底图：坐标系已非 150dpi 源页，只能走缩放底片路径
       setRotation(0); // 范本已是摆正后的图，载入时归零避免二次旋转
       applyCrop(null, refPage); // 默认整块即范本（载入后直接可再保存），框选才裁块
     };
@@ -278,16 +283,36 @@ export default function TemplateMakerPage() {
       setSaveMsg("dpi / 宽 / 高 必须是正整数");
       return;
     }
+    if (!page) {
+      setSaveMsg("页预览状态已失效，请重新上传源文件后再保存");
+      return;
+    }
     setSaving(true);
     setSaveMsg(null);
     try {
-      await updateTemplate(templateId, {
+      // 模具保存：后端按 dpi/width/height 真重渲染范本（ref 像素恒等于声明尺寸）。
+      // 无源文件（二次框选旧范本）时不传 file，后端直接用库中既有范本作缩放底片
+      // —— 范本 base64 不走 multipart：Starlette 普通 form 字段有 1MB/part 上限必超。
+      const eff: CropRect = crop ?? { x: 0, y: 0, w: page.preview_w, h: page.preview_h };
+      const res = await saveRefRendered(templateId, {
         dpi: d,
         width: w,
         height: h,
-        ref_image: refDataUrl,
+        page_index: refAsPage ? 0 : pageIndex,
+        rotation_deg: refAsPage ? 0 : rotation,
+        crop_x: eff.x,
+        crop_y: eff.y,
+        crop_w: eff.w,
+        crop_h: eff.h,
+        preview_w: page.preview_w,
+        preview_h: page.preview_h,
+        file: sourceFile,
       });
-      navigate("/templates");
+      if (res.backup_ok === false) {
+        setSaveMsg(`范本已保存，但共享目录备份失败：${res.backup_error ?? "未知原因"}`);
+      } else {
+        navigate("/templates");
+      }
     } catch (err) {
       setSaveMsg(err instanceof Error ? err.message : "保存失败");
     } finally {
@@ -478,8 +503,13 @@ export default function TemplateMakerPage() {
 
           <h2>模板规格</h2>
           <p className="page__hint">
-            框选后自动填入（按估算扫描 dpi 换算的物理像素），可手动修正。
+            预览即页图真实尺寸（方案 A），框选后自动填入真实像素宽高与 dpi，可手动修正。
           </p>
+          {page && page.dpi_estimated === false && (
+            <p className="page__hint">
+              ⚠ 未检测到该文件真实扫描 dpi，已按默认 {page.dpi} 显示（尺寸按此基准渲染），可手动修正。
+            </p>
+          )}
 
           <label className="form__field">
             <span>模板宽度（px）*</span>
@@ -509,14 +539,13 @@ export default function TemplateMakerPage() {
             />
           </label>
 
-          {page && (
-            <p className="page__hint">
-              {crop
-                ? `已框选块 ${crop.w}×${crop.h}px @ ${page.dpi}dpi；点「清除框选」恢复整页即范本`
-                : `未框选：整页即范本（${page.full_w}×${page.full_h}px @ ${page.dpi}dpi），可直接保存；需裁页中单块再拖框`}
-            </p>
-          )}
-
+              {page && (
+                <p className="page__hint">
+                  {crop
+                    ? `已框选块 ${crop.w}×${crop.h}px @ ${page.dpi}dpi；点「清除框选」恢复整页即范本`
+                    : `未框选：整页即范本（${page.full_w}×${page.full_h}px @ ${page.dpi}dpi），可直接保存；需裁页中单块再拖框`}
+                </p>
+              )}
           <h2 className="maker-page__side-title">范本预览</h2>
           {refDataUrl ? (
             <>

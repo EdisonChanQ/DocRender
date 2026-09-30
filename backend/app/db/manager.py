@@ -72,10 +72,15 @@ class DatabaseManager:
 
     def create_engine(self, config: DatabaseConfig, timeout: int = 5) -> Engine:
         connect_args: dict[str, object] = {}
+        pool_kwargs: dict[str, object] = {}
         if config.type.value == "sqlite":
             connect_args["check_same_thread"] = False
         elif config.type.value == "sqlserver":
             connect_args["timeout"] = timeout
+            # 队列 worker 多线程并发（claim 拆事务后单请求顺序消耗多个连接），
+            # SQLAlchemy 默认 5+10 偏小；瞬时涌开会打爆老服务器（2008R2 出现过
+            # 08001 预登录握手被重置），预建池 + 提高上限平滑连接建立。
+            pool_kwargs = {"pool_size": 10, "max_overflow": 20, "pool_timeout": 30}
         else:
             connect_args["connect_timeout"] = timeout
 
@@ -83,6 +88,7 @@ class DatabaseManager:
             self.build_url(config),
             pool_pre_ping=True,
             connect_args=connect_args,
+            **pool_kwargs,
         )
 
     def test(self, config: DatabaseConfig, timeout: int = 5) -> DatabaseTestResult:

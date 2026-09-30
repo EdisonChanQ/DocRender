@@ -15,7 +15,7 @@ from app.db.tables.base import TableDef
 
 TABLE = TableDef(
     key="file_page",
-    name="Sup_EWP_DCR_FilePage",
+    name="Sup_DCR_FilePage",
     comment="文件分页表（提取抢占单元）",
     ddl="""
 IF NOT EXISTS (

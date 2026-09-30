@@ -238,6 +238,11 @@ export default function HistoryJobPanel({ refreshToken = 0 }: { refreshToken?: n
                 <span>注册 {formatDateTime(active.created_datetime)}</span>
               </div>
               {active.error_msg && <p className="error">{active.error_msg}</p>}
+              {(detail?.legend?.match?.rejected_pages ?? 0) > 0 && (
+                <p className="status status--warn" style={{ display: "inline-block", margin: "4px 0" }}>
+                  本任务有 {detail?.legend?.match?.rejected_pages} 页配准失败，已隔离到 reject/ 目录待人工审计
+                </p>
+              )}
               {detailError && <p className="error">{detailError}</p>}
               {detailLoading && !detail && <p className="muted">查询中…</p>}
               {detail && <PageResultTables pages={detail.pages} />}

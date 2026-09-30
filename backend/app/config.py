@@ -45,6 +45,17 @@ class Settings(BaseSettings):
     ocr_model_dir: Path = BASE_DIR / "models"
     ocr_default_tier: str = "small"
 
+    # LLM-to-Text 工具（多模态大模型识别图片文字，OpenAI 兼容接口）
+    # 空 api_key 表示未配置，调用时返回明确错误而非静默降级。
+    llm_api_key: str = ""
+    llm_base_url: str = ""
+    llm_model: str = "gpt-4o"
+    llm_timeout_seconds: float = 60.0
+    # worker 提取兜底：OCR 平均置信度低于阈值时，裁原页块送 LLM 重识别。
+    # 需 llm_api_key 已配置才生效；关闭则纯 OCR/QR。
+    llm_fallback_enabled: bool = True
+    llm_confidence_threshold: float = 0.8
+
     # 流水线 worker（与后端同进程后台消费队列）
     worker_enabled: bool = True
     worker_idle_seconds: float = 3.0

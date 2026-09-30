@@ -65,6 +65,7 @@ from pathlib import Path
 from PIL import Image
 
 from app.config import settings
+from app.core.llm_vision import llm_extract_field
 from app.core.ocr_engine import ocr_bytes
 from app.core.qr_decode import decode_bytes
 from app.schemas.file_job import ClaimRequest, FailRequest, HeartbeatRequest
@@ -279,6 +280,19 @@ def process_job(job) -> None:
         f"{min(scores):.3f}~{max(scores):.3f}" if scores else "-",
         task_dir,
     )
+    for b in blocks:
+        if b.get("rescued"):
+            log.info(
+                "[%s] p%dc%d 近失救援入块：粗定位分未过阈值（ECC 复核通过 %s，band=%s）",
+                code, b["source_page"], b["page_index"],
+                b.get("match_score"), b.get("match_band"),
+            )
+    for d in rendered.get("dropped", []):
+        log.warning(
+            "[%s] p%s 块丢弃明细：%s",
+            code, d.get("page"),
+            "; ".join(f"{k}={v}" for k, v in d.items() if k != "page"),
+        )
 
     # ④ 组装页 + 切片登记载荷（每块 = 一条页记录；字段四角经 ECC 矩阵投影到块图坐标）
     #    注意：多模板选版后**每页可能命中不同模板**，字段清单须按块的实际 template_id 取
@@ -392,13 +406,16 @@ def process_job(job) -> None:
             for sl in page.get("slices") or []:
                 field = field_by_key.get(sl["field_key"]) if sl["field_key"] else None
                 is_qr = field is not None and field.field_type == "qr"
+                is_llm = field is not None and field.field_type == "llm"
+                # source 标签按块类型统一：qr→QR、llm→LLM、text→OCR
+                ftype_src = "QR" if is_qr else ("LLM" if is_llm else "OCR")
                 key = sl["field_key"] or f"__page{page['page_index']}__"
                 pad = field.pad if field is not None else 0
                 crop, _box = _crop(page_img, sl["x"], sl["y"], sl["width"], sl["height"], pad)
                 if crop is None:
                     data_map[key] = {
                         "value": None,
-                        "source": "QR" if is_qr else "OCR",
+                        "source": ftype_src,
                         "confidence": None,
                     }
                     continue
@@ -422,6 +439,48 @@ def process_job(job) -> None:
                             "source": "QR",
                             "confidence": 1.0 if text else None,
                         }
+                    elif is_llm:
+                        # llm 块：模板定义者显式指定大模型识别（手写签名金额、
+                        # 艺术字、盖章遮挡等——OCR 置信度虚高也照样错的场景）。
+                        # 不先跑 OCR，省一次推理；LLM 未配置时降级回 OCR。
+                        if not settings.llm_api_key:
+                            log.warning(
+                                "[%s] 页#%s 块 %s 声明 llm 但未配置 LLM_API_KEY，降级 OCR",
+                                code, page["page_index"], key,
+                            )
+                            _channel, lines = ocr_bytes(crop, settings.ocr_default_tier, "auto")
+                            text = "\n".join(ln["text"] for ln in lines).strip() or None
+                            scores = [ln["score"] for ln in lines if ln.get("score") is not None]
+                            avg = sum(scores) / len(scores) if scores else None
+                            data_map[key] = {
+                                "value": text,
+                                "source": "OCR",
+                                "confidence": round(avg, 3) if avg is not None else None,
+                            }
+                        else:
+                            label = field.label if field is not None else sl["field_key"]
+                            llm_text = llm_extract_field(crop, ".png", sl["field_key"], label)
+                            if llm_text:
+                                # confidence 留 None：LLM 没有校准过的置信度，
+                                # 不虚报 1.0（那正是 OCR 骗人的方式）；source=LLM 即语义。
+                                data_map[key] = {
+                                    "value": llm_text,
+                                    "source": "LLM",
+                                    "confidence": None,
+                                }
+                            else:
+                                # LLM 返回空（对 MICR 点阵/异常字体偶发放弃识别）时
+                                # 回退 OCR——空值落库等于该字段报废，OCR 残值更可用。
+                                log.info("[%s] 页#%s 块 %s LLM 返回空，回退 OCR", code, page["page_index"], key)
+                                _channel, lines = ocr_bytes(crop, settings.ocr_default_tier, "auto")
+                                text = "\n".join(ln["text"] for ln in lines).strip() or None
+                                scores = [ln["score"] for ln in lines if ln.get("score") is not None]
+                                avg = sum(scores) / len(scores) if scores else None
+                                data_map[key] = {
+                                    "value": text,
+                                    "source": "OCR",
+                                    "confidence": round(avg, 3) if avg is not None else None,
+                                }
                     else:
                         _channel, lines = ocr_bytes(crop, settings.ocr_default_tier, "auto")
                         text = "\n".join(ln["text"] for ln in lines).strip() or None
@@ -432,11 +491,36 @@ def process_job(job) -> None:
                             "source": "OCR",
                             "confidence": round(avg, 3) if avg is not None else None,
                         }
+                        # LLM 兜底：平均置信度低于阈值（或整块没识别出）时，
+                        # 用同一份裁块图 + 模板字段定义（field_key+标签）交多模态
+                        # 大模型重认。OCR 文本作为参考注入提示词；LLM 失败保留 OCR
+                        # 结果，不阻断提取。
+                        low_conf = avg is None or avg < settings.llm_confidence_threshold
+                        llm_ready = (
+                            settings.llm_fallback_enabled
+                            and bool(settings.llm_api_key)
+                            and sl["field_key"] is not None
+                        )
+                        if low_conf and llm_ready:
+                            try:
+                                label = field.label if field is not None else sl["field_key"]
+                                llm_text = llm_extract_field(crop, ".png", sl["field_key"], label, ocr_text=text)
+                                if llm_text:
+                                    data_map[key] = {"value": llm_text, "source": "LLM", "confidence": None}
+                                    log.info(
+                                        "[%s] 页#%s 块 %s OCR 置信 %.3f 低，LLM 兜底：%r",
+                                        code, page["page_index"], key,
+                                        avg if avg is not None else -1, llm_text[:50],
+                                    )
+                                else:
+                                    log.info("[%s] 页#%s 块 %s LLM 兜底返回空，保留 OCR 结果", code, page["page_index"], key)
+                            except Exception as lexc:  # noqa: BLE001 - 兜底失败不影响主流程
+                                log.warning("[%s] 页#%s 块 %s LLM 兜底失败：%s", code, page["page_index"], key, lexc)
                 except Exception as exc:  # noqa: BLE001 - 单块失败不拖垮整页
                     log.warning("[%s] 页#%s 块 %s 提取失败：%s", code, page["page_index"], key, exc)
                     data_map[key] = {
                         "value": None,
-                        "source": "QR" if is_qr else "OCR",
+                        "source": ftype_src,
                         "confidence": None,
                     }
 

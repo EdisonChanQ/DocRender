@@ -1,4 +1,4 @@
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
 
 from app.schemas.template import (
     TemplateCreate,
@@ -6,7 +6,7 @@ from app.schemas.template import (
     TemplatePublic,
     TemplateUpdate,
 )
-from app.services import template_prepare, template_service
+from app.services import template_prepare, template_ref_render, template_service
 
 router = APIRouter()
 
@@ -21,8 +21,6 @@ def _wrap(exc: template_service.TemplateError) -> HTTPException:
     if isinstance(exc, template_service.TemplateCodeGenerationError):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-
-
 @router.get("", response_model=TemplatePage)
 def list_templates(
     page: int = Query(default=1, ge=1, description="页码，从 1 开始"),
@@ -70,6 +68,52 @@ def get_template(template_id: int) -> TemplatePublic:
 def update_template(template_id: int, payload: TemplateUpdate) -> TemplatePublic:
     try:
         return template_service.update_template(template_id, payload)
+    except template_service.TemplateError as exc:
+        raise _wrap(exc) from exc
+
+
+@router.post("/{template_id}/ref-render", response_model=TemplatePublic)
+async def save_ref_rendered(
+    template_id: int,
+    dpi: int = Form(..., ge=1),
+    width: int = Form(..., ge=1),
+    height: int = Form(..., ge=1),
+    page_index: int = Form(0, ge=0),
+    rotation_deg: float = Form(0.0),
+    crop_x: float = Form(..., ge=0),
+    crop_y: float = Form(..., ge=0),
+    crop_w: float = Form(..., gt=0),
+    crop_h: float = Form(..., gt=0),
+    preview_w: int = Form(..., ge=1),
+    preview_h: int = Form(..., ge=1),
+    file: UploadFile | None = File(None, description="源文件（PDF/图片）；有则按门规格真重渲染，缺省用库中既有范本缩放"),
+) -> TemplatePublic:
+    """模具保存范本：按门规格（dpi/width/height）真重渲染 ref，字段坐标联动缩放，
+    入库同一份字节原样备份到 {shared}/categories/{分类code}/{模板code}/ref_image.png。
+
+    ⚠ 不要在这里加范本 base64 之类的普通 Form 字段：Starlette 对非文件 part 有
+    1MB 上限（MultiPartParser.max_part_size），范本图必超（"Part exceeded maximum
+    size of 1024KB"）。无源路径的底片由服务层直接读库。
+    """
+    from app.schemas.template import RefRenderRequest
+
+    req = RefRenderRequest(
+        dpi=dpi, width=width, height=height, page_index=page_index,
+        rotation_deg=rotation_deg, crop_x=crop_x, crop_y=crop_y,
+        crop_w=crop_w, crop_h=crop_h, preview_w=preview_w, preview_h=preview_h,
+    )
+    source = None
+    filename = ""
+    if file is not None:
+        try:
+            source = await file.read()
+            filename = file.filename or ""
+        finally:
+            await file.close()
+    try:
+        return template_service.save_ref_rendered(template_id, req, source, filename)
+    except template_ref_render.RefRenderError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except template_service.TemplateError as exc:
         raise _wrap(exc) from exc
 

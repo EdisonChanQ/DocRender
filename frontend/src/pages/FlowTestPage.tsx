@@ -18,7 +18,7 @@ import {
   type PreparedPage,
 } from "../api/template";
 import { fetchFields, type TemplateField } from "../api/templateField";
-import { ocrToText, qrDecodeOne } from "../api/tools";
+import { llmToText, ocrToText, qrDecodeOne } from "../api/tools";
 import type { Category, Template } from "../types";
 
 /**
@@ -262,6 +262,7 @@ export default function FlowTestPage() {
         for (const sl of pg.slices ?? []) {
           const f = sl.field_key ? fields.find((x) => x.field_key === sl.field_key) : null;
           const isQr = f?.field_type === "qr";
+          const isLlm = f?.field_type === "llm";
           const cropFile = cropPhysRect(
             img,
             sl.x,
@@ -274,7 +275,7 @@ export default function FlowTestPage() {
           );
           const key = sl.field_key ?? `__page${pg.page_index}__`;
           if (!cropFile) {
-            data[key] = { value: null, source: isQr ? "QR" : "OCR", confidence: null };
+            data[key] = { value: null, source: isQr ? "QR" : isLlm ? "LLM" : "OCR", confidence: null };
             note.push(`${key}:空块`);
             continue;
           }
@@ -284,6 +285,11 @@ export default function FlowTestPage() {
               const text = r0?.texts?.[0] ?? null;
               data[key] = { value: text, source: "QR", confidence: text ? 1 : null };
               note.push(`${key}:${text ? "✓" : "未识别"}`);
+            } else if (isLlm) {
+              const r0 = (await llmToText(cropFile, "", sl.field_key ?? "", f?.label ?? ""))[0];
+              const text = r0?.ok && r0.text ? r0.text : null;
+              data[key] = { value: text, source: "LLM", confidence: null };
+              note.push(`${key}:${text ? `LLM:${text.slice(0, 8)}` : "LLM空/失败"}`);
             } else {
               const r0 = (await ocrToText(cropFile, "small", "auto"))[0];
               const lines = r0?.lines ?? [];

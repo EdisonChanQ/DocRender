@@ -118,6 +118,10 @@ export interface Template {
   width: number | null;
   height: number | null;
   ref_image_b64?: string | null;
+  /** 模具保存后返回：共享目录备份相对路径 */
+  backup_path?: string | null;
+  backup_ok?: boolean | null;
+  backup_error?: string | null;
   is_enabled: boolean;
   created_by: string | null;
   created_datetime: string | null;

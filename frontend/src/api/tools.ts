@@ -46,3 +46,28 @@ export function ocrToText(file: File, tier: OcrTier, mode: OcrMode = "auto"): Pr
     body: form,
   });
 }
+
+export interface LlmFileResult {
+  filename: string;
+  ok: boolean;
+  text: string;
+  model: string;
+  server_ms: number;
+  error: string | null;
+}
+
+/** 单请求用多模态大模型识别一张图片文字（OpenAI 兼容接口）。
+ *  传 fieldKey+label 进入单字段抽取模式（llm 块：只回字段值）；留空为全文逐行模式。 */
+export function llmToText(file: File, model = "", fieldKey = "", label = ""): Promise<LlmFileResult[]> {
+  const form = new FormData();
+  form.append("files", file);
+  const qs = new URLSearchParams();
+  if (model) qs.set("model", model);
+  if (fieldKey) qs.set("field_key", fieldKey);
+  if (label) qs.set("label", label);
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return request<LlmFileResult[]>(`/tools/llm-to-text${suffix}`, {
+    method: "POST",
+    body: form,
+  });
+}

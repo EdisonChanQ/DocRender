@@ -50,9 +50,9 @@ class RegisterPagesRequest(BaseModel):
 class FieldExtract(BaseModel):
     """单字段提取结果三元组。"""
 
-    value: str | None = Field(description="解析值（OCR 文本 / 二维码载荷；未识别到为 null）")
-    source: Literal["OCR", "QR"] = Field(description="提取来源工具，对应模板字段 field_type")
-    confidence: float | None = Field(default=None, ge=0, le=1, description="识别置信度 0~1")
+    value: str | None = Field(description="解析值（OCR 文本 / 二维码载荷 / LLM 兜底值；未识别到为 null）")
+    source: Literal["OCR", "QR", "LLM"] = Field(description="提取来源：text 块 OCR、qr 块二维码、低置信 OCR 兜底 LLM")
+    confidence: float | None = Field(default=None, ge=0, le=1, description="识别置信度 0~1（LLM 兜底为 null）")
 
 
 class PageResultRequest(BaseModel):

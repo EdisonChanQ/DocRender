@@ -8,7 +8,7 @@
 - 提取实例（OCR / QR）claim 页 → get_page_for_extract 拉页信息+切片清单
   → 逐块解析 → 汇总 JSON → complete 回写页行 result_json。
   result_json 固定格式：{"data": {field_key: {value, source, confidence}}}，
-  每字段一条，source = OCR / QR（对应模板字段 field_type），confidence 0~1。
+  每字段一条，source = OCR / QR / LLM（text 块低置信时 LLM 兜底重认），confidence 0~1。
 - 页状态：0 待提取 / 1 处理中 / 2 成功 / 3 失败。
 - 页终态聚合 job：同 job 全部页终态（2/3）→ 有成功则 job=2，全失败则 job=3。
 - 租约（lease_expires_datetime）超时自动回收，claim 前顺带执行。
@@ -27,6 +27,7 @@ from app.db.config_store import config_store
 from app.db.manager import database_manager
 from app.db.tables import TABLES
 from app.schemas.file_job import ClaimRequest, HeartbeatRequest
+from app.services.db_retry import retry_on_lock_conflict
 
 PAGE_TABLE = TABLES["file_page"].name
 SLICE_TABLE = TABLES["file_slice"].name
@@ -146,15 +147,25 @@ def _fetch_page(conn, page_id: int, *, with_result: bool = False) -> dict | None
     return _page_to_public(row, with_result=with_result) if row is not None else None
 
 
-def reclaim_expired_pages(conn) -> None:
-    """租约超时的处理中页回收：retry+1 回待提取；超限置失败并聚合 job。"""
+def reclaim_expired_pages(conn) -> list[int]:
+    """租约超时的处理中页回收：retry+1 回待提取；超限置失败。
+
+    死锁结构性约束：本函数所在事务**只写 page 行、绝不碰 job**。
+    置失败的页其 job 聚合改由调用方在回收事务提交后独立短事务执行
+    （返回需聚合的 job_id 列表）。若在此同事务里聚合，会出现
+    「持一批 page X 锁 → 再读 page S / 写 job X」，两个并发回收互相
+    等对方手里的页锁即可成环（1205）。
+    """
     expired = conn.execute(
         text(
             f"SELECT id, job_id, retry_count, max_retry FROM {PAGE_TABLE} "
+            f"WITH (UPDLOCK, ROWLOCK, READPAST) "
             f"WHERE state = {PAGE_STATE_PROCESSING} "
-            f"AND lease_expires_datetime < SYSUTCDATETIME()"
+            f"AND lease_expires_datetime < SYSUTCDATETIME() "
+            f"ORDER BY id"
         )
     ).mappings().all()
+    failed_job_ids: list[int] = []
     for row in expired:
         retry_next = int(row["retry_count"]) + 1
         new_state = PAGE_STATE_FAILED if retry_next >= int(row["max_retry"]) else PAGE_STATE_PENDING
@@ -170,35 +181,90 @@ def reclaim_expired_pages(conn) -> None:
             {"state": new_state, "retry": retry_next, "id": int(row["id"])},
         )
         if new_state == PAGE_STATE_FAILED:
-            aggregate_job(conn, int(row["job_id"]))
+            failed_job_ids.append(int(row["job_id"]))
+    return failed_job_ids
+
+
+@retry_on_lock_conflict
+def _aggregate_job_detached(job_id: int) -> None:
+    """job 聚合的独立短事务：SELECT page（READPAST 不等锁）→ UPDATE job（单行 X）。
+
+    环形等待结构性拆除：聚合 SELECT 用 READPAST 跳过"正被其它事务改写"的页行，
+    读到其已提交的旧值（pending/processing）→ 判定"尚未全部终态"→ 本轮不聚合。
+    该偏差是**保守方向**（宁可少聚合，不会错聚合）：每个页终态转换都会触发聚合，
+    最后一个提交的 complete 必然看到全部页已提交终态，job 状态最终一致。
+    同时 SELECT 不再处于"持锁等待"状态，无法成为死锁环的一条边；
+    UPDATE job 是事务最后一条语句，拿到锁即结束，也不等待 —— 环上无闭合路径。
+    retry 作为残余竞争的兜底（聚合幂等，重试绝对安全）。
+    """
+    engine = get_engine()
+    with engine.begin() as conn:
+        aggregate_job(conn, job_id)
 
 
 def aggregate_job(conn, job_id: int) -> None:
-    """同 job 全部页终态（2/3）时聚合 job 状态（5等待OCR → 2成功/3失败）。幂等。"""
-    conn.execute(
+    """同 job 全部页终态（2/3）时聚合 job 状态（5等待OCR → 2成功/3失败）。幂等。
+
+    死锁修复（结构性）：原实现是单条 UPDATE 内嵌 page 表跨表子查询——执行时先拿
+    job 行 X 锁，再在子查询里回读 page 行，形成「job→page」反向锁边；与其它事务
+    正常的「page→job」方向交叉即成环形等待（1205）。现拆成先读后写：
+    ① SELECT 计数（READPAST：等不到锁就跳过读旧值，绝不阻塞）→ ② 单行 UPDATE job。
+    """
+    counts = conn.execute(
         text(
-            f"UPDATE {JOB_TABLE} SET "
-            f"  state = CASE WHEN EXISTS (SELECT 1 FROM {PAGE_TABLE} "
-            f"                WHERE job_id = :jid AND state = {PAGE_STATE_DONE}) "
-            f"            THEN 2 ELSE 3 END, "
-            f"  step = NULL, updated_datetime = SYSUTCDATETIME() "
-            f"WHERE id = :jid AND state = 5 "
-            f"  AND NOT EXISTS (SELECT 1 FROM {PAGE_TABLE} "
-            f"                  WHERE job_id = :jid AND state IN (0, 1))"
+            f"SELECT SUM(CASE WHEN state IN (0, 1) THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN state = 2 THEN 1 ELSE 0 END), COUNT(*) "
+            f"FROM {PAGE_TABLE} WITH (READPAST) WHERE job_id = :jid"
         ),
         {"jid": job_id},
+    ).first()
+    pending, done, total = (int(x or 0) for x in counts)
+    if pending > 0 or total == 0:
+        return  # 仍有非终态页，聚合条件未成立
+    new_state = PAGE_STATE_DONE if done > 0 else 3
+    conn.execute(
+        text(
+            f"UPDATE {JOB_TABLE} SET state = :st, step = NULL, "
+            f"  updated_datetime = SYSUTCDATETIME() "
+            f"WHERE id = :jid AND state = 5"
+        ),
+        {"st": new_state, "jid": job_id},
     )
 
 
-def claim_page(req: ClaimRequest) -> dict | None:
-    """提取实例抢占一个待提取页，**一次返回页信息 + 该页全部切片**（免二次拉取）。
+def _reclaim_pages_in_tx(engine: Engine) -> None:
+    """回收专用短事务：每轮 claim 前独立提交，不与抢占共享事务。
 
-    无任务返回 null。claim 前顺带回收到期租约。
+    拆事务原因（死锁结构性修复）：reclaim 若与 claim 同事务，长事务会同时持有
+    「一批过期 page 行的 X 锁」直到 claim 结束才放，与其它 complete_page 事务
+    交叉时等待窗口大，死锁概率高。拆成独立短事务后锁持有时间只覆盖回收本身。
+
+    页事务只写 page；置失败页的 job 聚合在回收事务**提交之后**用独立短事务做，
+    确保没有任何事务同时跨持 page→job 两表的 X 锁。
     """
-    engine = get_engine()
-    _check_tables()
     with engine.begin() as conn:
-        reclaim_expired_pages(conn)
+        failed_job_ids = reclaim_expired_pages(conn)
+        # 聚合自愈扫描：并发下两个 complete 的聚合可能互漏（各自 SELECT 都读到
+        # 对方未提交的旧值），job 会滞留 state=5。每轮 claim 扫一次「5 态且页全
+        # 终态」的 job 补聚合，保证最终收敛。扫描只读且 READPAST 不等锁，不构成
+        # 等待边；聚合在事务提交后的独立短事务里做。
+        stale = conn.execute(
+            text(
+                f"SELECT j.id FROM {JOB_TABLE} j WITH (READPAST) "
+                f"WHERE j.state = 5 "
+                f"AND EXISTS (SELECT 1 FROM {PAGE_TABLE} p WITH (READPAST) WHERE p.job_id = j.id) "
+                f"AND NOT EXISTS (SELECT 1 FROM {PAGE_TABLE} p WITH (READPAST) "
+                f"                    WHERE p.job_id = j.id AND p.state IN (0, 1))"
+            )
+        ).scalars().all()
+        failed_job_ids.extend(int(x) for x in stale)
+    for jid in dict.fromkeys(failed_job_ids):  # 去重且保序
+        _aggregate_job_detached(jid)
+
+
+def _claim_one_page(engine: Engine, inst: str, lease_minutes: int) -> dict | None:
+    """抢占事务（只干一件事）：抢一个待提取页，页信息+切片一次带回。"""
+    with engine.begin() as conn:
         row = conn.execute(
             text(
                 f"UPDATE {PAGE_TABLE} WITH (READPAST, ROWLOCK) "
@@ -207,18 +273,34 @@ def claim_page(req: ClaimRequest) -> dict | None:
                 f"    lease_expires_datetime = DATEADD(MINUTE, :lease, SYSUTCDATETIME()), "
                 f"    updated_datetime = SYSUTCDATETIME() "
                 f"OUTPUT inserted.id "
-                f"WHERE id = (SELECT TOP 1 id FROM {PAGE_TABLE} WITH (READPAST) "
+                f"WHERE id = (SELECT TOP 1 id FROM {PAGE_TABLE} WITH (UPDLOCK, READPAST, ROWLOCK) "
                 f"            WHERE state = {PAGE_STATE_PENDING} ORDER BY priority DESC, id)"
             ),
-            {"inst": req.instance_id, "lease": req.lease_minutes},
+            {"inst": inst, "lease": lease_minutes},
         ).first()
         if row is None:
             return None
         item = _fetch_page(conn, int(row[0]))
         if item is not None:
             item["slices"] = get_page_slices(conn, item["id"])
-    if item is None:  # pragma: no cover
-        raise FilePageError("抢占成功但读取失败")
+        if item is None:  # pragma: no cover
+            raise FilePageError("抢占成功但读取失败")
+    return item
+
+
+@retry_on_lock_conflict
+def claim_page(req: ClaimRequest) -> dict | None:
+    """提取实例抢占一个待提取页，**一次返回页信息 + 该页全部切片**（免二次拉取）。
+
+    无任务返回 null。流程 = 回收短事务 → 抢占短事务（各自独立提交），
+    死锁/锁超时自动重试。
+    """
+    engine = get_engine()
+    _check_tables()
+    _reclaim_pages_in_tx(engine)
+    item = _claim_one_page(engine, req.instance_id, req.lease_minutes)
+    if item is None:
+        return None
     return item
 
 
@@ -354,8 +436,13 @@ def complete_page(
             ),
             {"rj": payload, "inst": instance_id, "id": page_id},
         )
-        aggregate_job(conn, item["job_id"])
+        job_id = int(item["job_id"])
         item = _fetch_page(conn, page_id, with_result=True)
+    # 页事务只写 slice/page；聚合放到**提交之后**的独立短事务。
+    # 若同事务聚合：本事务持本页 X 锁 + 聚合持 job X 锁，与并发 complete /
+    # register / reclaim 交叉即可成环（1205）。聚合幂等（WHERE state=5），
+    # 且每个终态转换都会触发一次，最后一个提交的页的聚合必然看到全部终态。
+    _aggregate_job_detached(job_id)
     assert item is not None
     return item
 
@@ -377,9 +464,11 @@ def fail_page(page_id: int, *, instance_id: str, error_msg: str) -> dict:
             ),
             {"state": new_state, "retry": retry_next, "msg": error_msg[:1024], "id": page_id},
         )
-        if new_state == PAGE_STATE_FAILED:
-            aggregate_job(conn, item["job_id"])
+        need_aggregate = new_state == PAGE_STATE_FAILED
+        job_id = int(item["job_id"])
         item = _fetch_page(conn, page_id)
+    if need_aggregate:
+        _aggregate_job_detached(job_id)
     assert item is not None
     return item
 
@@ -509,12 +598,13 @@ def register_pipeline_output(job_code: str, instance_id: str, pages: list[dict])
 
 
 def _field_to_coord(f) -> dict:
-    """模板字段 → 坐标信息条目（含是否二维码区域）。"""
+    """模板字段 → 坐标信息条目（含提取工具标记：二维码 / LLM）。"""
     return {
         "field_key": f.field_key,
         "label": f.label,
         "field_type": f.field_type,
         "is_qr": f.field_type == "qr",
+        "is_llm": f.field_type == "llm",
         "x": f.x,
         "y": f.y,
         "width": f.width,

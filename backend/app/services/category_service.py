@@ -81,9 +81,14 @@ def _current_period() -> str:
 def _next_code(conn, table: str, period: str) -> str:
     prefix = f"{ID_PREFIX}{period}"
     start = len(prefix) + 1
+    # 目标库是 SQL Server 2008 R2（10.50，兼容级别 100），TRY_CAST 是 2012+ 才有的，
+    # 用了会直接 SQLExecDirectW 报 195。这里拆成两步等价实现：
+    #   NOT LIKE N'%[^0-9]%' 先判纯数字，再 CAST —— 效果等同 TRY_CAST 的「转换失败给 NULL」。
+    # 不用 ISNUMERIC 是因为它太宽松：'1e5'、'$1'、'1.2'、'+' 都会返回 1，但 CAST 会抛错。
     row = conn.execute(
         text(
-            f"SELECT ISNULL(MAX(TRY_CAST(SUBSTRING(code, :start, :width) AS INT)), 0) + 1 "
+            f"SELECT ISNULL(MAX(CASE WHEN SUBSTRING(code, :start, :width) NOT LIKE N'%[^0-9]%' "
+            f"THEN CAST(SUBSTRING(code, :start, :width) AS INT) END), 0) + 1 "
             f"FROM {table} WHERE code LIKE :pattern"
         ),
         {"start": start, "width": SEQ_WIDTH, "pattern": f"{prefix}%"},
@@ -205,11 +210,10 @@ def update_category(category_id: int, payload: CategoryUpdate) -> CategoryPublic
             if "is_enabled" in params:
                 params["is_enabled"] = bool(params["is_enabled"])
             params["id"] = category_id
-            params["updated_datetime"] = datetime.now(timezone.utc)
             conn.execute(
                 text(
                     f"UPDATE {table} SET {assignments}, "
-                    f"updated_datetime = :updated_datetime, updated_by = SUSER_SNAME() "
+                    f"updated_datetime = SYSUTCDATETIME(), updated_by = SUSER_SNAME() "
                     f"WHERE id = :id"
                 ),
                 params,

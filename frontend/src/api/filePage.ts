@@ -38,7 +38,7 @@ export interface FilePageRow {
 
 export interface FieldExtract {
   value: string | null;
-  source: "OCR" | "QR";
+  source: "OCR" | "QR" | "LLM";
   confidence: number | null;
 }
 
@@ -106,10 +106,19 @@ export function completePage(
   });
 }
 
+export type MatchBand = "auto" | "low" | "reject" | "unknown";
+
 export interface JobResultPage {
   page_index: number;
   state: number;
   template_id: number | null;
+  /** ECC 相关度（0~1）；无配准为 null */
+  match_score: number | null;
+  /** 匹配分档：auto 高可信 / low 偏低 / reject 已隔离待人工审计 / unknown 未配准 */
+  match_band?: MatchBand;
+  /** 页图（reject 页为 reject/ 目录下的隔离产物） */
+  normalized_rel_path?: string | null;
+  orig_rel_path?: string | null;
   result: { data: Record<string, FieldExtract> } | null;
   slices: FileSliceRow[];
   error_msg: string | null;
@@ -118,8 +127,28 @@ export interface JobResultPage {
 export interface JobResult {
   code: string;
   state: number;
-  file_name: string | null;
-  page_count: number;
+  /** 段1：文件任务信息（此前前端误把 file_name/page_count 当顶层字段，实际在 info 段） */
+  info: {
+    code: string;
+    file_name: string;
+    page_count: number | null;
+    attachment_pages: number;
+    category_name: string | null;
+    state_label: string;
+    error_msg: string | null;
+    [k: string]: unknown;
+  };
+  /** 段2：图例（含匹配统计） */
+  legend?: {
+    match?: {
+      score: number | null;
+      min_score: number | null;
+      band: MatchBand | null;
+      matched_pages: number;
+      rejected_pages: number;
+    };
+    [k: string]: unknown;
+  };
   pages: JobResultPage[];
 }
 

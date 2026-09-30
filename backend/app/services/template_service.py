@@ -11,7 +11,14 @@ from sqlalchemy.exc import IntegrityError
 from app.db.config_store import config_store
 from app.db.manager import database_manager
 from app.db.tables import TABLES
-from app.schemas.template import TemplateCreate, TemplatePage, TemplatePublic, TemplateUpdate
+from app.schemas.template import (
+    RefRenderRequest,
+    TemplateCreate,
+    TemplatePage,
+    TemplatePublic,
+    TemplateUpdate,
+)
+from app.services import template_ref_render as ref_render
 
 # 表名统一定义处：app/db/tables/*.py
 TEMPLATE_TABLE = TABLES["template"].name
@@ -31,7 +38,7 @@ _t = sa_table(
     column("is_enabled"), column("created_by"), column("created_datetime"),
     column("updated_by"), column("updated_datetime"),
 )
-_c = sa_table(CATEGORY_TABLE, column("id"), column("name"))
+_c = sa_table(CATEGORY_TABLE, column("id"), column("code"), column("name"))
 
 REF_IMAGE_MAX_BYTES = 8 * 1024 * 1024  # 范本图上限 8MB（base64 解码后）
 
@@ -123,9 +130,14 @@ def _current_period() -> str:
 def _next_code(conn, period: str) -> str:
     prefix = f"{ID_PREFIX}{period}"
     start = len(prefix) + 1
+    # 目标库是 SQL Server 2008 R2（10.50，兼容级别 100），TRY_CAST 是 2012+ 才有的，
+    # 用了会直接 SQLExecDirectW 报 195。这里拆成两步等价实现：
+    #   NOT LIKE N'%[^0-9]%' 先判纯数字，再 CAST —— 效果等同 TRY_CAST 的「转换失败给 NULL」。
+    # 不用 ISNUMERIC 是因为它太宽松：'1e5'、'$1'、'1.2'、'+' 都会返回 1，但 CAST 会抛错。
     row = conn.execute(
         text(
-            f"SELECT ISNULL(MAX(TRY_CAST(SUBSTRING(code, :start, :width) AS INT)), 0) + 1 "
+            f"SELECT ISNULL(MAX(CASE WHEN SUBSTRING(code, :start, :width) NOT LIKE N'%[^0-9]%' "
+            f"THEN CAST(SUBSTRING(code, :start, :width) AS INT) END), 0) + 1 "
             f"FROM {TEMPLATE_TABLE} WHERE code LIKE :pattern"
         ),
         {"start": start, "width": SEQ_WIDTH, "pattern": f"{prefix}%"},
@@ -267,11 +279,10 @@ def update_template(template_id: int, payload: TemplateUpdate) -> TemplatePublic
             if "is_enabled" in params:
                 params["is_enabled"] = bool(params["is_enabled"])
             params["id"] = template_id
-            params["updated_datetime"] = datetime.now(timezone.utc)
             conn.execute(
                 text(
                     f"UPDATE {TEMPLATE_TABLE} SET {assignments}, "
-                    f"updated_datetime = :updated_datetime, updated_by = SUSER_SNAME() "
+                    f"updated_datetime = SYSUTCDATETIME(), updated_by = SUSER_SNAME() "
                     f"WHERE id = :id"
                 ),
                 params,
@@ -292,13 +303,137 @@ def delete_template(template_id: int) -> None:
             raise TemplateNotFoundError("模板不存在")
 
 
+FIELD_TABLE = TABLES["template_field"].name
+
+_f = sa_table(
+    FIELD_TABLE,
+    column("id"), column("template_id"), column("x"), column("y"),
+    column("width"), column("height"), column("pad"),
+)
+
+
+def _rescale_fields(conn, template_id: int, old_w: int, old_h: int, new_w: int, new_h: int) -> int:
+    """范本换尺寸后把字段坐标从旧 ref 像素空间等比缩放到新空间（四舍五入，最小 1px）。
+
+    宽高比一致性已由模具校验一（2%）保证，sx≈sy。pad 是"识别留量像素"，
+    同样按尺度换算，保持物理留量不变。字段样本图（field.ref_image）不重裁：
+    它是 OCR 底片参考，下次字段编辑时前端会按新范本重新裁取。
+    """
+    if old_w == new_w and old_h == new_h:
+        return 0
+    sx, sy = new_w / old_w, new_h / old_h
+    rows = conn.execute(select(_f.c.id, _f.c.x, _f.c.y, _f.c.width, _f.c.height, _f.c.pad).where(
+        _f.c.template_id == template_id
+    )).all()
+    for rid, x, y, w, h, pad in rows:
+        conn.execute(
+            text(
+                f"UPDATE {FIELD_TABLE} SET x = :x, y = :y, width = :w, height = :h, pad = :pad, "
+                f"updated_datetime = SYSUTCDATETIME(), updated_by = SUSER_SNAME() WHERE id = :id"
+            ),
+            {
+                "x": int(round(x * sx)), "y": int(round(y * sy)),
+                "w": max(1, int(round(w * sx))), "h": max(1, int(round(h * sy))),
+                "pad": int(round((pad or 0) * ((sx + sy) / 2))), "id": rid,
+            },
+        )
+    return len(rows)
+
+
+def save_ref_rendered(template_id: int, req: RefRenderRequest, source: bytes | None,
+                      source_filename: str) -> TemplatePublic:
+    """模具重渲染并保存范本：ref 像素恒等于声明尺寸 + 字段坐标联动 + 共享目录备份。
+
+    备份失败**不回滚**入库（图已经存对），仅在返回体标记 backup_ok=False。
+    """
+    engine = get_engine()
+    _check_names()
+
+    ref_raw_old: bytes | None = None
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(_t.c.id, _t.c.code, _t.c.category_id, _t.c.ref_image).where(_t.c.id == template_id)
+        ).first()
+        if row is None:
+            raise TemplateNotFoundError("模板不存在")
+        tpl_id, tpl_code = row[0], row[1]
+        category_id = row[2]
+        ref_raw_old = bytes(row[3]) if row[3] is not None else None
+
+    # —— 模具重渲染（含全部几何校验，失败抛 RefRenderError → 路由 400）——
+    # 无源文件（二次框选旧范本）时的缩放底片 = 库中既有 ref（ref_raw_old）。
+    # 不从前端传范本 base64：Starlette 普通 form 字段有 1MB/part 上限，范本必超。
+    ref_raw_new = ref_render.render_ref(
+        source=source,
+        source_filename=source_filename,
+        ref_raw=ref_raw_old,
+        page_index=req.page_index,
+        rotation_deg=req.rotation_deg,
+        crop=(req.crop_x, req.crop_y, req.crop_w, req.crop_h),
+        preview_size=(req.preview_w, req.preview_h),
+        dpi=req.dpi,
+        width=req.width,
+        height=req.height,
+    )
+    if len(ref_raw_new) > REF_IMAGE_MAX_BYTES:
+        raise TemplateError(f"重渲染范本超过 {REF_IMAGE_MAX_BYTES // (1024 * 1024)}MB 限制")
+
+    # —— 旧 ref 尺寸（字段坐标缩放基准；无旧 ref 则无需缩放）——
+    old_size: tuple[int, int] | None = None
+    if ref_raw_old is not None:
+        try:
+            from PIL import Image
+            import io
+
+            with Image.open(io.BytesIO(ref_raw_old)) as im:
+                old_size = im.size
+        except Exception:  # noqa: BLE001 - 旧图坏了不阻塞换新
+            old_size = None
+
+    backup_rel: str | None = None
+    backup_err: str | None = None
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"UPDATE {TEMPLATE_TABLE} SET dpi = :dpi, width = :w, height = :h, ref_image = :ref, "
+                f"updated_datetime = SYSUTCDATETIME(), updated_by = SUSER_SNAME() WHERE id = :id"
+            ),
+            {"dpi": req.dpi, "w": req.width, "h": req.height, "ref": ref_raw_new, "id": tpl_id},
+        )
+        n = 0
+        if old_size is not None:
+            n = _rescale_fields(conn, tpl_id, old_size[0], old_size[1], req.width, req.height)
+        item = _fetch_by_id(conn, tpl_id)
+        cat_code = conn.execute(select(_c.c.code).where(_c.c.id == category_id)).scalar()
+
+    # —— 共享目录备份（事务外：网络盘失败不回滚库）——
+    try:
+        from app.services import file_job_service
+
+        shared_dir = file_job_service.get_shared_dir()
+        backup_rel, backup_err = ref_render.backup_ref_to_shared(
+            shared_dir=shared_dir,
+            category_code=str(cat_code or "unknown"),
+            template_code=str(tpl_code),
+            raw=ref_raw_new,
+        )
+    except Exception as exc:  # noqa: BLE001
+        backup_err = f"备份失败：{exc}"
+
+    assert item is not None
+    item.backup_path = backup_rel
+    item.backup_ok = backup_err is None
+    item.backup_error = backup_err
+    return item
+
+
 def disable_templates_of_category(conn, category_id: int) -> None:
     """供分类删除时调用：该分类下所有模板置为失效（is_enabled=0），模板本身保留。"""
     conn.execute(
         text(
             f"UPDATE {TEMPLATE_TABLE} SET is_enabled = 0, "
-            f"updated_datetime = :now, updated_by = SUSER_SNAME() "
+            f"updated_datetime = SYSUTCDATETIME(), updated_by = SUSER_SNAME() "
             f"WHERE category_id = :category_id"
         ),
-        {"now": datetime.now(timezone.utc), "category_id": category_id},
+        {"category_id": category_id},
     )

@@ -13,7 +13,7 @@ from app.db.tables.base import TableDef
 
 TABLE = TableDef(
     key="file_job",
-    name="Sup_EWP_DCR_FileJob",
+    name="Sup_DCR_FileJob",
     comment="文件任务注册表",
     ddl="""
 IF NOT EXISTS (

@@ -11,7 +11,7 @@ from app.db.tables.base import TableDef
 
 TABLE = TableDef(
     key="category",
-    name="Sup_EWP_DCR_Category",
+    name="Sup_DCR_Category",
     comment="分类表",
     ddl="""
 IF NOT EXISTS (

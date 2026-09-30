@@ -4,7 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 FIELD_KEY_PATTERN = r"^[A-Za-z][A-Za-z0-9_]{0,63}$"
-FieldType = Literal["text", "qr"]
+FieldType = Literal["text", "qr", "llm"]
 
 
 class TemplateFieldCreate(BaseModel):
@@ -13,7 +13,10 @@ class TemplateFieldCreate(BaseModel):
         description="字段命名（OCR JSON 输出键，字母开头，允许字母数字下划线，如 payee/amount_upper）",
     )
     label: str = Field(min_length=1, max_length=128, description="字段说明（如 收款人、金额大写）")
-    field_type: FieldType = Field(default="text", description="块类型：text 走 OCR，qr 走二维码解码")
+    field_type: FieldType = Field(
+        default="text",
+        description="块类型：text 走 OCR，qr 走二维码解码，llm 走多模态大模型识别（手写/艺术字等 OCR 不可靠的块）",
+    )
     x: int = Field(ge=0, description="块左上角 X（范本图像素）")
     y: int = Field(ge=0, description="块左上角 Y（范本图像素）")
     width: int = Field(ge=1, description="块宽（像素）")
@@ -29,7 +32,7 @@ class TemplateFieldCreate(BaseModel):
 class TemplateFieldUpdate(BaseModel):
     field_key: str | None = Field(default=None, min_length=1, max_length=64, pattern=FIELD_KEY_PATTERN)
     label: str | None = Field(default=None, min_length=1, max_length=128)
-    field_type: FieldType | None = Field(default=None, description="text / qr")
+    field_type: FieldType | None = Field(default=None, description="text / qr / llm")
     x: int | None = Field(default=None, ge=0)
     y: int | None = Field(default=None, ge=0)
     width: int | None = Field(default=None, ge=1)

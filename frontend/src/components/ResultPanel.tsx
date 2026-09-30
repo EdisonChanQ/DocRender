@@ -75,9 +75,14 @@ export default function ResultPanel({ job }: Props) {
       {detail && (
         <>
           <div className="panel__meta" style={{ marginTop: 16 }}>
-            <strong>{detail.file_name ?? detail.code}</strong>
-            <span>{detail.page_count} 页</span>
+            <strong>{detail.info.file_name ?? detail.code}</strong>
+            <span>{detail.info.page_count ?? detail.pages.length} 页</span>
             <span>{detail.pages.length} 条页记录</span>
+            {(detail.legend?.match?.rejected_pages ?? 0) > 0 && (
+              <span className="status status--warn">
+                {detail.legend?.match?.rejected_pages} 页待审（配准失败）
+              </span>
+            )}
           </div>
           <PageResultTables pages={detail.pages} />
         </>
